@@ -1,47 +1,161 @@
-use good_lp::{Solution, SolverModel, default_solver, variables};
+use std::collections::HashMap;
 
-use crate::types::{self, Card};
+use good_lp::{
+    Expression, ProblemVariables, Solution, SolverModel, Variable, default_solver, solvers::microlp::MicroLpProblem, variable
+};
 
-type CardMat = [[usize; 4]; 14]; 
+use crate::types::{self, Card, Group, Rank, Suit, RANKS, SUITS};
 
+const SET_MAX: usize = 4;  // max cards in a set
+const SEQ_MAX: usize = 14; // max cards in a sequence (A 2 3 … K A)
+
+type CardMat = [[usize; SET_MAX]; SEQ_MAX];
+
+/// Compute a matrix of card counts indexed by rank and suit.
+/// Index 13 mirrors index 0 (Ace) for ace-high sequence detection.
 fn card_matrix(cards: &[Card]) -> CardMat {
-    let mut mat = [[0; 4]; 14];
+    let mut mat: CardMat = [[0; SET_MAX]; SEQ_MAX];
     for card in cards {
         mat[card.rank.index()][card.suit.index()] += 1;
+    }
+    for s in 0..4 {
+        mat[13][s] = mat[0][s];
     }
     mat
 }
 
-pub fn solve(cards: &[Card], jokers: usize) -> Result<types::Solution, String> {
-    // TODO: implement actual LP-based Machiavelli solver
-    //
-    // Dummy good_lp usage to verify the dependency compiles.
-    // This will be replaced with the real formulation.
-    let _ = _dummy_lp();
+/// Enumerate all valid sequences (3-14 consecutive ranks of a single suit).
+fn enumerate_sequences(mat: &CardMat) -> Vec<Group> {
+    let mut groups = Vec::new();
 
-    let _ = (cards, jokers);
-    Ok(types::Solution::default())
-}
-
-/// Dummy LP to verify good_lp + microlp compiles and links.
-fn _dummy_lp() -> Result<(), String> {
-    variables! {
-        vars:
-            0 <= x <= 10;
-            0 <= y <= 10;
+    for suit in SUITS {
+        for start in 0..(SEQ_MAX - 2) {
+            if mat[start][suit.index()] == 0 {
+                continue;
+            }
+            // Find how far this consecutive run extends
+            let mut end = start + 1;
+            while end < SEQ_MAX && mat[end][suit.index()] > 0 {
+                end += 1;
+            }
+            // Add all valid-length sequences starting here
+            for len in 3..=(end - start) {
+                let cards = (start..start + len)
+                    .map(|i| Card::new(Rank::from_index(i % 13), suit)) // wrap index for ace-high
+                    .collect();
+                groups.push(Group { jokers: 0, cards });
+            }
+        }
     }
 
-    let solution = vars
-        .maximise(x + y)
-        .using(default_solver)
-        .with(x + y << 15)
-        .solve()
-        .map_err(|e| e.to_string())?;
+    groups
+}
 
-    let _x_val = solution.value(x);
-    let _y_val = solution.value(y);
+/// Enumerate all valid sets (3–4 cards of the same rank, each a different suit).
+fn enumerate_sets(mat: &CardMat) -> Vec<Group> {
+    let mut groups = Vec::new();
 
-    Ok(())
+    for rank in RANKS {
+        let suits_present: Vec<Suit> = SUITS.iter().copied()
+            .filter(|&s| mat[rank.index()][s.index()] > 0)
+            .collect();
+        let n = suits_present.len();
+        let cards: Vec<Card> = suits_present.iter().map(|&s| Card::new(rank, s)).collect();
+
+        // Add the set with all suits present (if 3 or 4 suits are present)
+        if n >= 3 {
+            groups.push(Group { jokers: 0, cards: cards.clone() });
+        }
+
+        // Add all possible subsets (if 4 suits are present)
+        if n == 4 {
+            for skip_idx in 0..4 {
+                let mut cards_removed = cards.clone();
+                cards_removed.remove(skip_idx);
+                groups.push(Group { jokers: 0, cards: cards_removed });
+            }
+        }
+    }
+
+    groups
+}
+
+/// Compute the maximum number of times each group can be selected based on the input card counts.
+fn group_max(mat: &CardMat, groups: &[Group]) -> Vec<usize> {
+    groups
+        .iter()
+        .map(|group| {
+            group
+                .cards
+                .iter()
+                .map(|c| mat[c.rank.index()][c.suit.index()])
+                .min()
+                .unwrap_or(0)
+        })
+        .collect()
+}
+
+/// Compute a mapping from each card to the indices of groups that contain it.
+fn card_to_groups(groups: &[Group]) -> HashMap<Card, Vec<usize>> {
+    let mut card_to_groups: HashMap<Card, Vec<usize>> = HashMap::new();
+    for (idx, group) in groups.iter().enumerate() {
+        for &card in &group.cards {
+            card_to_groups.entry(card).or_default().push(idx);
+        }
+    }
+    card_to_groups
+}
+
+fn build_lp(mat: &CardMat, groups: &[Group]) -> (MicroLpProblem, Vec<Variable>) {
+    let group_max = group_max(mat, groups);
+    let card_to_groups = card_to_groups(groups);
+
+    // Variables: the number of times we select each group
+    let mut vars = ProblemVariables::new();
+    let x: Vec<Variable> = group_max
+        .iter()
+        .map(|&gm| vars.add(variable().integer().min(0).max(gm as f64)))
+        .collect();
+
+    // Objective: maximise total cards placed, with a small tiebreaker favouring fewer groups
+    let objective: Expression = groups
+        .iter()
+        .enumerate()
+        .map(|(i, group)| x[i] * group.cards.len() as f64 - x[i] * (1.0 / 1024.0))
+        .sum();
+    let mut model = vars.maximise(objective).using(default_solver);
+
+    // Constraints:
+    //  - Each input card must not be used more times than its total occurrence in the input.
+    for (&card, group_indices) in &card_to_groups {
+        let lhs: Expression = group_indices.iter().map(|&idx| x[idx]).sum();
+        model = model.with(lhs << mat[card.rank.index()][card.suit.index()] as f64);
+    }
+
+    (model, x)
+}
+
+pub fn solve(cards: &[Card], _jokers: usize) -> Result<types::Solution, String> {
+    let mat = card_matrix(cards);
+
+    let groups: Vec<Group> =
+        [enumerate_sequences(&mat), enumerate_sets(&mat)].concat();
+    if groups.is_empty() {
+        return Ok(types::Solution::default());
+    }
+
+    let (model, x) = build_lp(&mat, &groups);
+    let solution = model.solve().map_err(|e| e.to_string())?;
+
+    let mut result = types::Solution::default();
+    for (idx, group) in groups.into_iter().enumerate() {
+        let val = solution.value(x[idx]).round() as usize;
+        for _ in 0..val {
+            result.add_group(group.clone());
+        }
+    }
+
+    Ok(result)
 }
 
 /// Note: this test suite is entirely AI-generated.

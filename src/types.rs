@@ -2,7 +2,7 @@ use serde::Serialize;
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub enum Rank {
     Ace,
     Two,
@@ -19,14 +19,34 @@ pub enum Rank {
     King,
 }
 
+pub const RANKS: [Rank; 13] = [
+    Rank::Ace,
+    Rank::Two,
+    Rank::Three,
+    Rank::Four,
+    Rank::Five,
+    Rank::Six,
+    Rank::Seven,
+    Rank::Eight,
+    Rank::Nine,
+    Rank::Ten,
+    Rank::Jack,
+    Rank::Queen,
+    Rank::King,
+];
+
 impl Rank {
     pub const fn index(self) -> usize {
         self as usize
     }
+
+    pub const fn from_index(i: usize) -> Self {
+        RANKS[i]
+    }
 }
 
 #[wasm_bindgen]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub enum Suit {
     Spades,
     Clubs,
@@ -34,14 +54,20 @@ pub enum Suit {
     Hearts,
 }
 
+pub const SUITS: [Suit; 4] = [Suit::Spades, Suit::Clubs, Suit::Diamonds, Suit::Hearts];
+
 impl Suit {
     pub const fn index(self) -> usize {
         self as usize
     }
+
+    pub const fn from_index(i: usize) -> Self {
+        SUITS[i]
+    }
 }
 
 #[wasm_bindgen]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct Card {
     pub rank: Rank,
     pub suit: Suit,
@@ -61,7 +87,7 @@ impl Card {
 }
 
 #[wasm_bindgen]
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct Group {
     pub jokers: usize,
     #[wasm_bindgen(getter_with_clone)]
