@@ -52,9 +52,8 @@ impl GameState {
         self.jokers += 1;
     }
 
-    /// Solve the current game state.
-    /// Returns a `Solution` containing the groups of cards that form valid sets/sequences.
-    pub fn solve(&self) -> Result<Solution, JsValue> {
-        solver::solve(&self.cards, self.jokers).map_err(|e| JsValue::from_str(&e))
+    /// Solve the current game state. If no solution exists, returns None.
+    pub fn solve(&self) -> Option<Solution> {
+        solver::solve(&self.cards, self.jokers)
     }
 }

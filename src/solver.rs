@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use good_lp::{
     Expression, ProblemVariables, Solution, SolverModel, Variable, default_solver, solvers::microlp::MicroLpProblem, variable
@@ -18,13 +18,17 @@ fn card_matrix(cards: &[Card]) -> CardMat {
     for card in cards {
         mat[card.rank.index()][card.suit.index()] += 1;
     }
-    for s in 0..4 {
-        mat[13][s] = mat[0][s];
-    }
+    mat[13] = mat[0];
     mat
 }
 
-/// Enumerate all valid sequences (3-14 consecutive ranks of a single suit).
+/// Compute all possible groups we can obtain by substituting jokers into an existing group.
+/// Note that the group itself may already contain jokers.
+fn joker_substitute(_group: &Group, _jokers: usize) -> Vec<Group> {
+    vec![]
+}
+
+/// Enumerate all valid sequences (3-14 consecutive ranks of a single suit)
 fn enumerate_sequences(mat: &CardMat) -> Vec<Group> {
     let mut groups = Vec::new();
 
@@ -106,6 +110,7 @@ fn card_to_groups(groups: &[Group]) -> HashMap<Card, Vec<usize>> {
     card_to_groups
 }
 
+/// Build the Mixed-Integer Linear Program to solve the card grouping problem.
 fn build_lp(mat: &CardMat, groups: &[Group]) -> (MicroLpProblem, Vec<Variable>) {
     let group_max = group_max(mat, groups);
     let card_to_groups = card_to_groups(groups);
@@ -135,17 +140,17 @@ fn build_lp(mat: &CardMat, groups: &[Group]) -> (MicroLpProblem, Vec<Variable>) 
     (model, x)
 }
 
-pub fn solve(cards: &[Card], _jokers: usize) -> Result<types::Solution, String> {
+pub fn solve(cards: &[Card], _jokers: usize) -> Option<types::Solution> {
     let mat = card_matrix(cards);
 
     let groups: Vec<Group> =
         [enumerate_sequences(&mat), enumerate_sets(&mat)].concat();
     if groups.is_empty() {
-        return Ok(types::Solution::default());
+        return None;
     }
 
     let (model, x) = build_lp(&mat, &groups);
-    let solution = model.solve().map_err(|e| e.to_string())?;
+    let solution = model.solve().ok()?;
 
     let mut result = types::Solution::default();
     for (idx, group) in groups.into_iter().enumerate() {
@@ -155,7 +160,7 @@ pub fn solve(cards: &[Card], _jokers: usize) -> Result<types::Solution, String> 
         }
     }
 
-    Ok(result)
+    Some(result)
 }
 
 /// Note: this test suite is entirely AI-generated.
@@ -305,17 +310,13 @@ mod tests {
 
     #[test]
     fn empty_input() {
-        let sol = solve(&[], 0).unwrap();
-        validate_solution(&sol, &[], 0);
-        assert_eq!(sol.groups().len(), 0);
+        assert!(solve(&[], 0).is_none());
     }
 
     #[test]
     fn single_card_no_jokers() {
         let cards = [Card::new(Rank::Ace, Suit::Spades)];
-        let sol = solve(&cards, 0).unwrap();
-        validate_solution(&sol, &cards, 0);
-        assert_cards_placed(&sol, 0);
+        assert!(solve(&cards, 0).is_none());
     }
 
     #[test]
@@ -324,9 +325,7 @@ mod tests {
             Card::new(Rank::Ace, Suit::Spades),
             Card::new(Rank::Two, Suit::Spades),
         ];
-        let sol = solve(&cards, 0).unwrap();
-        validate_solution(&sol, &cards, 0);
-        assert_cards_placed(&sol, 0);
+        assert!(solve(&cards, 0).is_none());
     }
 
     // ── Simple Sets ────────────────────────────────────────────────────
@@ -366,9 +365,7 @@ mod tests {
             Card::new(Rank::Five, Suit::Spades),
             Card::new(Rank::Five, Suit::Clubs),
         ];
-        let sol = solve(&cards, 0).unwrap();
-        validate_solution(&sol, &cards, 0);
-        assert_cards_placed(&sol, 0);
+        assert!(solve(&cards, 0).is_none());
     }
 
     #[test]
@@ -445,9 +442,7 @@ mod tests {
             Card::new(Rank::Ace, Suit::Diamonds),
             Card::new(Rank::Two, Suit::Diamonds),
         ];
-        let sol = solve(&cards, 0).unwrap();
-        validate_solution(&sol, &cards, 0);
-        assert_cards_placed(&sol, 0);
+        assert!(solve(&cards, 0).is_none());
     }
 
     #[test]
@@ -750,9 +745,7 @@ mod tests {
             Card::new(Rank::Nine, Suit::Spades),
             Card::new(Rank::King, Suit::Spades),
         ];
-        let sol = solve(&cards, 0).unwrap();
-        validate_solution(&sol, &cards, 0);
-        assert_cards_placed(&sol, 0);
+        assert!(solve(&cards, 0).is_none());
     }
 
     #[test]
@@ -761,9 +754,7 @@ mod tests {
             Card::new(Rank::Two, Suit::Spades),
             Card::new(Rank::Two, Suit::Hearts),
         ];
-        let sol = solve(&cards, 0).unwrap();
-        validate_solution(&sol, &cards, 0);
-        assert_cards_placed(&sol, 0);
+        assert!(solve(&cards, 0).is_none());
     }
 
     #[test]
@@ -853,17 +844,14 @@ mod tests {
     }
 
     #[test]
-    fn no_valid_groups_returns_empty() {
+    fn no_valid_groups_returns_none() {
         let cards = [
             Card::new(Rank::Ace, Suit::Spades),
             Card::new(Rank::Three, Suit::Clubs),
             Card::new(Rank::Seven, Suit::Diamonds),
             Card::new(Rank::Jack, Suit::Hearts),
         ];
-        let sol = solve(&cards, 0).unwrap();
-        validate_solution(&sol, &cards, 0);
-        assert_cards_placed(&sol, 0);
-        assert_eq!(sol.groups().len(), 0);
+        assert!(solve(&cards, 0).is_none());
     }
 
     #[test]
@@ -886,9 +874,7 @@ mod tests {
             Card::new(Rank::Five, Suit::Clubs),
             Card::new(Rank::Six, Suit::Spades),
         ];
-        let sol = solve(&cards, 0).unwrap();
-        validate_solution(&sol, &cards, 0);
-        assert_cards_placed(&sol, 0);
+        assert!(solve(&cards, 0).is_none());
     }
 
     #[test]
