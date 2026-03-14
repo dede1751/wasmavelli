@@ -29,6 +29,8 @@ checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
 [[package]]
 name = "good_lp"
 version = "1.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8c071f15f0c38eb6445a8100660c5806f4c597b611f24442de1b31b87d41da5c"
 dependencies = [
  "fnv",
  "microlp",
