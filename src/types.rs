@@ -154,7 +154,7 @@ impl fmt::Display for Card {
 }
 
 #[wasm_bindgen]
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Default, Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct Group {
     #[wasm_bindgen(getter_with_clone)]
     pub cards: Vec<Card>,
@@ -181,19 +181,35 @@ impl Group {
     }
 }
 
+impl std::ops::Add for &Group {
+    type Output = Group;
+    fn add(self, rhs: Self) -> Self::Output {
+        let mut cards = self.cards.clone();
+        cards.extend(rhs.cards.iter().cloned());
+        Group { cards }
+    }
+}
+
+impl std::ops::AddAssign for Group {
+    fn add_assign(&mut self, rhs: Self) {
+        self.cards.extend(rhs.cards);
+    }
+}
+
 #[wasm_bindgen]
 #[derive(Default, Debug, Clone, Serialize)]
 pub struct Solution {
     #[wasm_bindgen(getter_with_clone)]
     groups: Vec<Group>,
+    #[wasm_bindgen(getter_with_clone)]
+    remaining: Group,
 }
 
 #[wasm_bindgen]
 impl Solution {
-    /// Serialize the full solution to a JS object (array of Group objects).
     #[wasm_bindgen(js_name = asObject)]
     pub fn as_object(&self) -> Result<JsValue, JsValue> {
-        serde_wasm_bindgen::to_value(&self.groups).map_err(|e| e.into())
+        serde_wasm_bindgen::to_value(self).map_err(|e| e.into())
     }
 }
 
@@ -203,7 +219,13 @@ impl fmt::Display for Solution {
             if i > 0 {
                 writeln!(f)?;
             }
-            write!(f, "{group}")?;
+            write!(f, "Group {}: {}", i + 1, group)?;
+        }
+        if !self.remaining.cards.is_empty() {
+            if !self.groups.is_empty() {
+                writeln!(f)?;
+            }
+            write!(f, "Remaining: {}", self.remaining)?;
         }
         Ok(())
     }
@@ -215,8 +237,18 @@ impl Solution {
         self.groups.push(group);
     }
 
-    /// Access groups from Rust.
+    /// Add remaining cards from the player's hand.
+    pub fn add_remaining(&mut self, card: Card) {
+        self.remaining.cards.push(card);
+    }
+
+    /// Access groups.
     pub fn groups(&self) -> &[Group] {
         &self.groups
+    }
+
+    /// Access remaining cards.
+    pub fn remaining(&self) -> &Group {
+        &self.remaining
     }
 }

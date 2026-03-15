@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
 use good_lp::{
-    Expression, ProblemVariables, Solution, SolverModel, Variable, default_solver,
-    solvers::microlp::MicroLpProblem, variable, constraint
+    Expression, ProblemVariables, Solution, SolverModel, Variable, constraint, default_solver,
+    solvers::microlp::MicroLpProblem, variable,
 };
 
 use crate::types::{self, Card, Group, RANKS, Rank, SUITS, Suit};
@@ -14,9 +14,9 @@ type CardMat = [[usize; SET_MAX + 1]; SEQ_MAX + 1]; // We have an extra row/colu
 
 /// Compute a matrix of card counts indexed by rank and suit.
 /// Index 13 mirrors index 0 (Ace) for ace-high sequence detection.
-fn card_matrix(cards: &[Card]) -> CardMat {
+fn card_matrix(group: &Group) -> CardMat {
     let mut mat: CardMat = [[0; SET_MAX + 1]; SEQ_MAX + 1];
-    for card in cards {
+    for card in &group.cards {
         mat[card.rank.index()][card.suit.index()] += 1;
     }
     mat[13] = mat[0];
@@ -167,7 +167,7 @@ fn dedup_groups(groups: Vec<Group>) -> Vec<Group> {
 }
 
 /// Compute the maximum number of times each group can be selected based on the input card counts.
-fn group_max(mat: &CardMat, groups: &[Group]) -> Vec<usize> {
+fn group_max(full_mat: &CardMat, groups: &[Group]) -> Vec<usize> {
     groups
         .iter()
         .map(|group| {
@@ -177,7 +177,7 @@ fn group_max(mat: &CardMat, groups: &[Group]) -> Vec<usize> {
             }
             card_counts
                 .iter()
-                .map(|(c, &need)| mat[c.rank.index()][c.suit.index()] / need)
+                .map(|(c, &need)| full_mat[c.rank.index()][c.suit.index()] / need)
                 .min()
                 .unwrap_or(0)
         })
@@ -197,8 +197,13 @@ fn card_to_groups(groups: &[Group]) -> HashMap<Card, Vec<usize>> {
 }
 
 /// Build the Mixed-Integer Linear Program to solve the card grouping problem.
-fn build_lp(mat: &CardMat, cards: &[Card], groups: &[Group]) -> (MicroLpProblem, Vec<Variable>) {
-    let group_max = group_max(mat, groups);
+fn build_lp(
+    full_mat: &CardMat,
+    board: &Group,
+    hand: &Group,
+    groups: &[Group],
+) -> (MicroLpProblem, Vec<Variable>) {
+    let group_max = group_max(full_mat, groups);
     let card_to_groups = card_to_groups(groups);
 
     // Variables: the number of times we select each group
@@ -217,34 +222,58 @@ fn build_lp(mat: &CardMat, cards: &[Card], groups: &[Group]) -> (MicroLpProblem,
     let mut model = vars.maximise(objective).using(default_solver);
 
     // Constraint: each input card must be used exactly as many times as it appears in the input
-    for card in cards {
+    //  - each board card must be used exactly once
+    //  - each hand card can be used at most once
+    let card_set: HashSet<Card> = board
+        .cards
+        .iter()
+        .chain(hand.cards.iter())
+        .cloned()
+        .collect();
+    let board_mat = card_matrix(board);
+    let hand_mat = card_matrix(hand);
+    for card in card_set.iter() {
         let lhs: Expression = card_to_groups
             .get(card)
             .map(|group_indices| group_indices.iter().map(|&idx| x[idx]).sum())
             .unwrap_or_else(|| 0.0.into());
-        let rhs = mat[card.rank.index()][card.suit.index()] as f64;
-        model = model.with(constraint!(lhs == rhs));
+        let board_bound = board_mat[card.rank.index()][card.suit.index()] as f64;
+        let hand_bound = hand_mat[card.rank.index()][card.suit.index()] as f64;
+        model = model.with(constraint!(lhs.clone() >= board_bound));
+        model = model.with(constraint!(lhs <= hand_bound + board_bound));
     }
 
     (model, x)
 }
 
-pub fn solve(cards: &[Card]) -> Option<types::Solution> {
-    let mat = card_matrix(cards);
+pub fn solve(board: &Group, hand: &Group) -> Option<types::Solution> {
+    let all_cards = board + hand;
+    let full_mat = card_matrix(&all_cards);
 
-    let groups = dedup_groups([enumerate_sequences(&mat), enumerate_sets(&mat)].concat());
-    if groups.is_empty() {
+    let groups = dedup_groups([enumerate_sequences(&full_mat), enumerate_sets(&full_mat)].concat());
+    if groups.is_empty() && hand.cards.is_empty() {
         return None;
     }
 
-    let (model, x) = build_lp(&mat, cards, &groups);
+    let (model, x) = build_lp(&full_mat, board, hand, &groups);
     let solution = model.solve().ok()?;
 
     let mut result = types::Solution::default();
+    let mut used_cards = Group::default();
     for (idx, group) in groups.into_iter().enumerate() {
         let val = solution.value(x[idx]).round() as usize;
         for _ in 0..val {
             result.add_group(group.clone());
+            used_cards += group.clone();
+        }
+    }
+
+    let mut used_mat = card_matrix(&used_cards);
+    for &card in &hand.cards {
+        let (r, s) = (card.rank.index(), card.suit.index());
+        if used_mat[r][s] < full_mat[r][s] {
+            result.add_remaining(card);
+            used_mat[r][s] += 1;
         }
     }
 
@@ -255,7 +284,6 @@ pub fn solve(cards: &[Card]) -> Option<types::Solution> {
 mod tests {
     use super::*;
     use crate::types::{Card, Group, Rank, Suit};
-    use std::collections::HashMap;
 
     fn is_valid_set(g: &Group) -> bool {
         let len = g.cards.len();
@@ -329,89 +357,112 @@ mod tests {
         is_valid_set(g) || is_valid_sequence(g)
     }
 
-    fn count_cards<I>(cards: I) -> HashMap<Card, usize>
-    where
-        I: IntoIterator<Item = Card>,
-    {
-        let mut counts = HashMap::new();
-        for card in cards {
-            *counts.entry(card).or_default() += 1;
+    fn g(cards: impl Into<Vec<Card>>) -> Group {
+        Group {
+            cards: cards.into(),
         }
-        counts
     }
 
     #[track_caller]
-    fn assert_exact_solution(input: &[Card], expected_groups: Option<usize>) {
-        let input_group = Group { cards: input.to_vec() };
-        let sol = solve(input).unwrap_or_else(|| {
-            panic!("Expected exact cover, but solve() returned None. \ninput: {input_group}")
+    fn assert_solution(
+        board: Group,
+        hand: Group,
+        expected_groups: Option<usize>,
+        expected_remaining: Option<usize>,
+    ) {
+        let input_str = format!("Board: {board}\nHand: {hand}");
+        let sol = solve(&board, &hand).unwrap_or_else(|| {
+            panic!("Expected exact cover, but solve() returned None. \n{input_str}")
         });
 
         for (i, g) in sol.groups().iter().enumerate() {
-            assert!(is_valid_group(g), "Group {i} is not a valid set or sequence: {g}");
+            assert!(
+                is_valid_group(g),
+                "Group {i} is not a valid set or sequence: {g}"
+            );
         }
 
         if let Some(n) = expected_groups {
             assert_eq!(
                 sol.groups().len(),
                 n,
-                "Expected {n} groups, got {}.\ninput:{input_group}\nsolution: {sol}",
+                "Expected {n} groups, got {}.\n{input_str}\nSolution:\n{sol}",
                 sol.groups().len()
             );
         }
 
-        let used_counts = count_cards(
-            sol.groups()
-                .iter()
-                .flat_map(|g| g.cards.iter().copied()),
-        );
-        let input_counts = count_cards(input.iter().copied());
+        if let Some(n) = expected_remaining {
+            assert_eq!(
+                sol.remaining().cards.len(),
+                n,
+                "Expected {n} remaining cards, got {}.\n{input_str}\nSolution:\n{sol}",
+                sol.remaining().cards.len()
+            );
+        }
 
+        let used_cards = sol
+            .groups()
+            .iter()
+            .fold(sol.remaining().clone(), |acc, g| &acc + g);
+        let input_cards = &board + &hand;
         assert_eq!(
-            used_counts,
-            input_counts,
-            "Solution does not use exactly the input cards.\ninput: {input_group}\nsolution: {sol}"
+            card_matrix(&used_cards),
+            card_matrix(&input_cards),
+            "Solution does not use exactly the input cards.\n{input_str}\nSolution:\n{sol}"
         );
     }
 
     #[track_caller]
-    fn assert_no_solution(input: &[Card]) {
-        let input_group = Group { cards: input.to_vec() };
-        let sol = solve(input);
-        assert!(sol.is_none(), "Expected no exact cover, but got a solution.\ninput: {input_group}\nsolution: {}", sol.unwrap());
+    fn assert_exact_solution(board: Group, expected_groups: Option<usize>) {
+        assert_solution(board, Group::default(), expected_groups, Some(0));
+    }
+
+    #[track_caller]
+    fn assert_no_solution(board: Group, hand: Group) {
+        let sol = solve(&board, &hand);
+        assert!(
+            sol.is_none(),
+            "Expected no exact cover, but got a solution.\nBoard: {board}\nHand: {hand}\nSolution:\n{}",
+            sol.unwrap()
+        );
+    }
+
+    #[track_caller]
+    fn assert_no_exact_solution(board: Group) {
+        assert_no_solution(board, Group::default());
     }
 
     // ── Trivial impossibility / exact-cover semantics ───────────────────
 
     #[test]
     fn too_short_inputs_are_unsolved() {
-        assert_no_solution(&[]);
-        assert_no_solution(&[Card::new(Rank::Ace, Suit::Spades)]);
-        assert_no_solution(&[
+        assert_no_exact_solution(g([]));
+        assert_no_exact_solution(g([Card::new(Rank::Ace, Suit::Spades)]));
+        assert_no_exact_solution(g([
             Card::new(Rank::Ace, Suit::Spades),
             Card::new(Rank::Two, Suit::Spades),
-        ]);
-        assert_no_solution(&[Card::JOKER; 2]);
+        ]));
+        assert_no_exact_solution(g([Card::JOKER; 2]));
     }
 
     #[test]
     fn unrelated_cards_have_no_solution() {
-        assert_no_solution(&[
+        assert_no_exact_solution(g([
             Card::new(Rank::Ace, Suit::Spades),
             Card::new(Rank::Three, Suit::Clubs),
             Card::new(Rank::Seven, Suit::Diamonds),
             Card::new(Rank::Jack, Suit::Hearts),
-        ]);
+        ]));
     }
 
     #[test]
     fn leftover_card_rejects_partial_cover() {
-        assert_no_solution(&[
+        assert_no_exact_solution(g([
             Card::new(Rank::Ace, Suit::Spades),
             Card::new(Rank::Ace, Suit::Clubs),
             Card::new(Rank::Ace, Suit::Diamonds),
             Card::new(Rank::Seven, Suit::Hearts),
-        ]);
+        ]));
     }
 
     // ── Sets ────────────────────────────────────────────────────────────
@@ -419,11 +470,11 @@ mod tests {
     #[test]
     fn set_of_three_is_solved() {
         assert_exact_solution(
-            &[
+            g([
                 Card::new(Rank::Five, Suit::Spades),
                 Card::new(Rank::Five, Suit::Clubs),
                 Card::new(Rank::Five, Suit::Diamonds),
-            ],
+            ]),
             Some(1),
         );
     }
@@ -431,29 +482,29 @@ mod tests {
     #[test]
     fn set_of_four_is_solved() {
         assert_exact_solution(
-            &[
+            g([
                 Card::new(Rank::King, Suit::Spades),
                 Card::new(Rank::King, Suit::Clubs),
                 Card::new(Rank::King, Suit::Diamonds),
                 Card::new(Rank::King, Suit::Hearts),
-            ],
+            ]),
             Some(1),
         );
     }
 
     #[test]
     fn duplicate_suit_does_not_make_a_set() {
-        assert_no_solution(&[
+        assert_no_exact_solution(g([
             Card::new(Rank::Five, Suit::Spades),
             Card::new(Rank::Five, Suit::Spades),
             Card::new(Rank::Five, Suit::Clubs),
-        ]);
+        ]));
     }
 
     #[test]
     fn duplicate_deck_can_make_two_sets() {
         assert_exact_solution(
-            &[
+            g([
                 Card::new(Rank::Eight, Suit::Spades),
                 Card::new(Rank::Eight, Suit::Clubs),
                 Card::new(Rank::Eight, Suit::Diamonds),
@@ -462,7 +513,7 @@ mod tests {
                 Card::new(Rank::Eight, Suit::Clubs),
                 Card::new(Rank::Eight, Suit::Diamonds),
                 Card::new(Rank::Eight, Suit::Hearts),
-            ],
+            ]),
             Some(2),
         );
     }
@@ -472,11 +523,11 @@ mod tests {
     #[test]
     fn simple_sequence_is_solved() {
         assert_exact_solution(
-            &[
+            g([
                 Card::new(Rank::Three, Suit::Hearts),
                 Card::new(Rank::Four, Suit::Hearts),
                 Card::new(Rank::Five, Suit::Hearts),
-            ],
+            ]),
             Some(1),
         );
     }
@@ -484,11 +535,11 @@ mod tests {
     #[test]
     fn ace_low_sequence_is_solved() {
         assert_exact_solution(
-            &[
+            g([
                 Card::new(Rank::Ace, Suit::Spades),
                 Card::new(Rank::Two, Suit::Spades),
                 Card::new(Rank::Three, Suit::Spades),
-            ],
+            ]),
             Some(1),
         );
     }
@@ -496,42 +547,39 @@ mod tests {
     #[test]
     fn ace_high_sequence_is_solved() {
         assert_exact_solution(
-            &[
+            g([
                 Card::new(Rank::Queen, Suit::Clubs),
                 Card::new(Rank::King, Suit::Clubs),
                 Card::new(Rank::Ace, Suit::Clubs),
-            ],
+            ]),
             Some(1),
         );
     }
 
     #[test]
     fn maximal_14_card_sequence_is_solved() {
-        let mut cards: Vec<Card> = RANKS
-            .iter()
-            .map(|&r| Card::new(r, Suit::Hearts))
-            .collect();
+        let mut cards: Vec<Card> = RANKS.iter().map(|&r| Card::new(r, Suit::Hearts)).collect();
         cards.push(Card::new(Rank::Ace, Suit::Hearts)); // Ace-high copy from duplicate deck
-        assert_exact_solution(&cards, Some(1));
+        assert_exact_solution(Group { cards }, Some(1));
     }
 
     #[test]
     fn sequence_cannot_wrap_around() {
-        assert_no_solution(&[
+        assert_no_exact_solution(g([
             Card::new(Rank::Queen, Suit::Hearts),
             Card::new(Rank::King, Suit::Hearts),
             Card::new(Rank::Ace, Suit::Hearts),
             Card::new(Rank::Two, Suit::Hearts),
-        ]);
+        ]));
     }
 
     #[test]
     fn wrong_suit_breaks_sequence() {
-        assert_no_solution(&[
+        assert_no_exact_solution(g([
             Card::new(Rank::Four, Suit::Spades),
             Card::new(Rank::Five, Suit::Clubs),
             Card::new(Rank::Six, Suit::Spades),
-        ]);
+        ]));
     }
 
     // ── Jokers ──────────────────────────────────────────────────────────
@@ -539,14 +587,14 @@ mod tests {
     #[test]
     fn joker_fills_internal_gaps_in_sequence() {
         assert_exact_solution(
-            &[
+            g([
                 Card::new(Rank::Two, Suit::Clubs),
                 Card::JOKER,
                 Card::new(Rank::Four, Suit::Clubs),
                 Card::new(Rank::Five, Suit::Clubs),
                 Card::JOKER,
                 Card::new(Rank::Seven, Suit::Clubs),
-            ],
+            ]),
             Some(1),
         );
     }
@@ -554,20 +602,20 @@ mod tests {
     #[test]
     fn joker_can_complete_ace_edge_sequences() {
         assert_exact_solution(
-            &[
+            g([
                 Card::new(Rank::Queen, Suit::Clubs),
                 Card::new(Rank::King, Suit::Clubs),
                 Card::JOKER,
-            ],
+            ]),
             Some(1),
         );
 
         assert_exact_solution(
-            &[
+            g([
                 Card::new(Rank::Ace, Suit::Diamonds),
                 Card::new(Rank::Two, Suit::Diamonds),
                 Card::JOKER,
-            ],
+            ]),
             Some(1),
         );
     }
@@ -575,11 +623,7 @@ mod tests {
     #[test]
     fn one_real_card_and_two_jokers_is_still_solvable() {
         assert_exact_solution(
-            &[
-                Card::new(Rank::Six, Suit::Clubs),
-                Card::JOKER,
-                Card::JOKER,
-            ],
+            g([Card::new(Rank::Six, Suit::Clubs), Card::JOKER, Card::JOKER]),
             Some(1),
         );
     }
@@ -587,29 +631,29 @@ mod tests {
     #[test]
     fn two_real_cards_and_a_joker_can_form_a_set() {
         assert_exact_solution(
-            &[
+            g([
                 Card::new(Rank::Ten, Suit::Spades),
                 Card::new(Rank::Ten, Suit::Diamonds),
                 Card::JOKER,
-            ],
+            ]),
             Some(1),
         );
     }
 
     #[test]
     fn pure_jokers_can_form_one_or_multiple_groups() {
-        assert_exact_solution(&[Card::JOKER; 3], Some(1));
-        assert_exact_solution(&[Card::JOKER; 15], Some(2));
+        assert_exact_solution(g([Card::JOKER; 3]), Some(1));
+        assert_exact_solution(g([Card::JOKER; 15]), Some(2));
     }
 
     #[test]
     fn joker_cannot_enable_wraparound_sequence() {
-        assert_no_solution(&[
+        assert_no_exact_solution(g([
             Card::new(Rank::King, Suit::Hearts),
             Card::new(Rank::Ace, Suit::Hearts),
             Card::JOKER,
             Card::new(Rank::Two, Suit::Hearts),
-        ]);
+        ]));
     }
 
     // ── Multiple groups / ambiguous allocation ─────────────────────────
@@ -617,14 +661,14 @@ mod tests {
     #[test]
     fn two_disjoint_sets_are_solved() {
         assert_exact_solution(
-            &[
+            g([
                 Card::new(Rank::Ace, Suit::Spades),
                 Card::new(Rank::Ace, Suit::Clubs),
                 Card::new(Rank::Ace, Suit::Diamonds),
                 Card::new(Rank::King, Suit::Spades),
                 Card::new(Rank::King, Suit::Clubs),
                 Card::new(Rank::King, Suit::Hearts),
-            ],
+            ]),
             Some(2),
         );
     }
@@ -632,14 +676,14 @@ mod tests {
     #[test]
     fn set_and_sequence_are_solved_together() {
         assert_exact_solution(
-            &[
+            g([
                 Card::new(Rank::Three, Suit::Spades),
                 Card::new(Rank::Three, Suit::Clubs),
                 Card::new(Rank::Three, Suit::Diamonds),
                 Card::new(Rank::Seven, Suit::Hearts),
                 Card::new(Rank::Eight, Suit::Hearts),
                 Card::new(Rank::Nine, Suit::Hearts),
-            ],
+            ]),
             Some(2),
         );
     }
@@ -647,14 +691,14 @@ mod tests {
     #[test]
     fn duplicate_deck_can_make_two_identical_sequences() {
         assert_exact_solution(
-            &[
+            g([
                 Card::new(Rank::Four, Suit::Spades),
                 Card::new(Rank::Five, Suit::Spades),
                 Card::new(Rank::Six, Suit::Spades),
                 Card::new(Rank::Four, Suit::Spades),
                 Card::new(Rank::Five, Suit::Spades),
                 Card::new(Rank::Six, Suit::Spades),
-            ],
+            ]),
             Some(2),
         );
     }
@@ -662,14 +706,14 @@ mod tests {
     #[test]
     fn shared_card_requires_correct_allocation() {
         assert_exact_solution(
-            &[
+            g([
                 Card::new(Rank::Five, Suit::Spades),
                 Card::new(Rank::Five, Suit::Clubs),
                 Card::new(Rank::Five, Suit::Diamonds),
                 Card::new(Rank::Five, Suit::Hearts),
                 Card::new(Rank::Four, Suit::Spades),
                 Card::new(Rank::Six, Suit::Spades),
-            ],
+            ]),
             Some(2),
         );
     }
@@ -677,14 +721,14 @@ mod tests {
     #[test]
     fn joker_can_enable_two_groups() {
         assert_exact_solution(
-            &[
+            g([
                 Card::new(Rank::Jack, Suit::Spades),
                 Card::new(Rank::Jack, Suit::Clubs),
                 Card::new(Rank::Jack, Suit::Diamonds),
                 Card::new(Rank::Ten, Suit::Diamonds),
                 Card::JOKER,
                 Card::new(Rank::Queen, Suit::Diamonds),
-            ],
+            ]),
             Some(2),
         );
     }
@@ -692,14 +736,14 @@ mod tests {
     #[test]
     fn set_plus_pure_joker_group_is_solved() {
         assert_exact_solution(
-            &[
+            g([
                 Card::new(Rank::Ace, Suit::Spades),
                 Card::new(Rank::Ace, Suit::Clubs),
                 Card::new(Rank::Ace, Suit::Diamonds),
                 Card::JOKER,
                 Card::JOKER,
                 Card::JOKER,
-            ],
+            ]),
             Some(2),
         );
     }
@@ -707,7 +751,7 @@ mod tests {
     #[test]
     fn interlocking_exact_cover_is_solved() {
         assert_exact_solution(
-            &[
+            g([
                 Card::new(Rank::Three, Suit::Spades),
                 Card::new(Rank::Four, Suit::Spades),
                 Card::new(Rank::Five, Suit::Spades),
@@ -717,7 +761,7 @@ mod tests {
                 Card::new(Rank::Three, Suit::Diamonds),
                 Card::new(Rank::Four, Suit::Diamonds),
                 Card::new(Rank::Five, Suit::Diamonds),
-            ],
+            ]),
             Some(3),
         );
     }
@@ -728,13 +772,15 @@ mod tests {
             .iter()
             .flat_map(|&r| SUITS.iter().map(move |&s| Card::new(r, s)))
             .collect();
-        assert_exact_solution(&cards, Some(4));
+        assert_exact_solution(g(cards), Some(4));
     }
+
+    // ── Board / hand differentiation ────────────────────────────────────
 
     #[test]
     fn real_game_47_cards() {
         // This is the game that prompted making this solver.
-        let board = vec![
+        let board = g([
             Card::new(Rank::Queen, Suit::Spades),
             Card::new(Rank::King, Suit::Spades),
             Card::new(Rank::Ace, Suit::Spades),
@@ -779,13 +825,191 @@ mod tests {
             Card::new(Rank::Six, Suit::Diamonds),
             Card::new(Rank::Seven, Suit::Diamonds),
             Card::new(Rank::Eight, Suit::Diamonds),
-        ];
-        let hand = vec![
+        ]);
+        let hand = g([
             Card::new(Rank::Queen, Suit::Clubs),
             Card::new(Rank::King, Suit::Spades),
             Card::new(Rank::Queen, Suit::Diamonds),
-        ];
-        assert_exact_solution(&board, None);
-        assert_no_solution(&[board, hand].concat());
+        ]);
+        let full = &board + &hand;
+        assert_solution(board, hand, None, Some(2));
+        assert_no_exact_solution(full);
+    }
+
+    #[test]
+    fn unplayable_hand_cards_remain() {
+        let board = g([
+            Card::new(Rank::Ace, Suit::Spades),
+            Card::new(Rank::Ace, Suit::Clubs),
+            Card::new(Rank::Ace, Suit::Diamonds),
+        ]);
+        let hand = g([
+            Card::new(Rank::Seven, Suit::Hearts),
+            Card::new(Rank::Jack, Suit::Diamonds),
+        ]);
+        assert_solution(board, hand, Some(1), Some(2));
+    }
+
+    #[test]
+    fn hand_completes_impossible_board() {
+        let board = g([
+            Card::new(Rank::Three, Suit::Hearts),
+            Card::new(Rank::Four, Suit::Hearts),
+        ]);
+        let hand = g([Card::new(Rank::Five, Suit::Hearts)]);
+        assert_solution(board, hand, Some(1), Some(0));
+    }
+
+    #[test]
+    fn hand_cannot_complete_impossible_board() {
+        let board = g([
+            Card::new(Rank::Ace, Suit::Spades),
+            Card::new(Rank::Seven, Suit::Hearts),
+        ]);
+        let hand = g([Card::new(Rank::Jack, Suit::Diamonds)]);
+        assert_no_solution(board, hand);
+    }
+
+    #[test]
+    fn hand_extends_sequence() {
+        let board = g([
+            Card::new(Rank::Six, Suit::Spades),
+            Card::new(Rank::Seven, Suit::Spades),
+            Card::new(Rank::Eight, Suit::Spades),
+        ]);
+        let hand = g([Card::new(Rank::Nine, Suit::Spades)]);
+        assert_solution(board, hand, Some(1), Some(0));
+    }
+
+    #[test]
+    fn hand_extends_set() {
+        let board = g([
+            Card::new(Rank::Ace, Suit::Spades),
+            Card::new(Rank::Ace, Suit::Clubs),
+            Card::new(Rank::Ace, Suit::Diamonds),
+        ]);
+        let hand = g([Card::new(Rank::Ace, Suit::Hearts)]);
+        assert_solution(board, hand, Some(1), Some(0));
+    }
+
+    #[test]
+    fn partial_hand_usage() {
+        let board = g([
+            Card::new(Rank::Five, Suit::Spades),
+            Card::new(Rank::Five, Suit::Clubs),
+            Card::new(Rank::Five, Suit::Diamonds),
+        ]);
+        let hand = g([
+            Card::new(Rank::Five, Suit::Hearts),
+            Card::new(Rank::Jack, Suit::Clubs),
+        ]);
+        assert_solution(board, hand, Some(1), Some(1));
+    }
+
+    #[test]
+    fn hand_card_enables_board_rearrangement() {
+        let board = g([
+            Card::new(Rank::Four, Suit::Hearts),
+            Card::new(Rank::Five, Suit::Hearts),
+            Card::new(Rank::Six, Suit::Hearts),
+            Card::new(Rank::Six, Suit::Clubs),
+            Card::new(Rank::Seven, Suit::Clubs),
+        ]);
+        let hand = g([Card::new(Rank::Eight, Suit::Clubs)]);
+        assert_solution(board, hand, Some(2), Some(0));
+    }
+
+    #[test]
+    fn empty_board_returns_hand() {
+        let board = Group::default();
+        let hand = g([
+            Card::new(Rank::Ace, Suit::Spades),
+            Card::new(Rank::Seven, Suit::Hearts),
+        ]);
+        assert_solution(board, hand, Some(0), Some(2));
+    }
+
+    #[test]
+    fn empty_board_hand_forms_set() {
+        let board = Group::default();
+        let hand = g([
+            Card::new(Rank::Ten, Suit::Spades),
+            Card::new(Rank::Ten, Suit::Clubs),
+            Card::new(Rank::Ten, Suit::Diamonds),
+        ]);
+        assert_solution(board, hand, Some(1), Some(0));
+    }
+
+    #[test]
+    fn hand_joker_completes_board_sequence() {
+        let board = g([
+            Card::new(Rank::Nine, Suit::Diamonds),
+            Card::new(Rank::Jack, Suit::Diamonds),
+        ]);
+        let hand = g([Card::JOKER]);
+        assert_solution(board, hand, Some(1), Some(0));
+    }
+
+    #[test]
+    fn all_hand_cards_used_when_possible() {
+        let board = g([
+            Card::new(Rank::Three, Suit::Spades),
+            Card::new(Rank::Four, Suit::Spades),
+            Card::new(Rank::Five, Suit::Spades),
+        ]);
+        let hand = g([
+            Card::new(Rank::Three, Suit::Clubs),
+            Card::new(Rank::Three, Suit::Diamonds),
+            Card::new(Rank::Three, Suit::Hearts),
+        ]);
+        assert_solution(board, hand, Some(2), Some(0));
+    }
+
+    #[test]
+    fn duplicate_hand_cards_partially_used() {
+        let board = g([
+            Card::new(Rank::Two, Suit::Clubs),
+            Card::new(Rank::Two, Suit::Diamonds),
+        ]);
+        let hand = g([
+            Card::new(Rank::Two, Suit::Hearts),
+            Card::new(Rank::Two, Suit::Hearts),
+        ]);
+        assert_solution(board, hand, Some(1), Some(1));
+    }
+
+    #[test]
+    fn hand_joins_sequences() {
+        let board = g([
+            Card::new(Rank::Two, Suit::Clubs),
+            Card::new(Rank::Three, Suit::Clubs),
+            Card::new(Rank::Four, Suit::Clubs),
+            Card::new(Rank::Eight, Suit::Clubs),
+            Card::new(Rank::Nine, Suit::Clubs),
+            Card::new(Rank::Ten, Suit::Clubs),
+        ]);
+        let hand = g([
+            Card::new(Rank::Five, Suit::Clubs),
+            Card::new(Rank::Six, Suit::Clubs),
+            Card::new(Rank::Seven, Suit::Clubs),
+        ]);
+        assert_solution(board, hand, Some(1), Some(0));
+    }
+
+    #[test]
+    fn prefer_more_cards_over_fewer_groups() {
+        let board = g([
+            Card::new(Rank::Two, Suit::Clubs),
+            Card::new(Rank::Three, Suit::Clubs),
+            Card::new(Rank::Four, Suit::Clubs),
+            Card::new(Rank::Six, Suit::Clubs),
+            Card::new(Rank::Seven, Suit::Clubs),
+            Card::new(Rank::Eight, Suit::Clubs),
+        ]);
+        let hand = g([
+            Card::new(Rank::Five, Suit::Clubs),
+            Card::new(Rank::Six, Suit::Clubs),
+        ]);
+        assert_solution(board, hand, Some(2), Some(0));
     }
 }

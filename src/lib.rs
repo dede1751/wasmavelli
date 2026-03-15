@@ -6,25 +6,33 @@
 ///
 /// await init();
 /// const game = new GameState();
-/// game.add_card(new Card(Rank.Ace, Suit.Spades));
-/// game.add_card(new Card(Rank.Two, Suit.Spades));
-/// game.add_card(new Card(Rank.Three, Suit.Spades));
-/// game.add_card(Card.joker());
-/// const solution = game.solve(); // returns Solution with JS-serializable groups
+/// game.add_board_card(new Card(Rank.Ace, Suit.Spades));  // board cards must be used
+/// game.add_board_card(new Card(Rank.Two, Suit.Spades));
+/// game.add_hand_card(new Card(Rank.Three, Suit.Spades)); // hand cards can be left unused
+/// game.add_hand_card(Card.joker());
+/// game.add_hand_card(new Card(Rank.Four, Suit.Hearts));
+/// const sol1 = game.solve();
+/// // sol1: { groups: [A♠, 2♠, 3♠, JOKER], remaining: [4♥] } 
+/// 
+/// game.clear();
+/// game.add_board_card(new Card(Rank.Ace, Suit.Spades));
+/// const sol2 = game.solve();
+/// // sol2: null
 /// ```
 use wasm_bindgen::prelude::*;
 
 pub mod solver;
 pub mod types;
 
-use types::{Card, Solution};
+use types::{Card, Group, Solution};
 
 // ── GameState ────────────────────────────────────────────────────────────────
 
 #[wasm_bindgen]
 #[derive(Default)]
 pub struct GameState {
-    cards: Vec<Card>,
+    board: Group,
+    hand: Group,
 }
 
 #[wasm_bindgen]
@@ -35,18 +43,24 @@ impl GameState {
         Self::default()
     }
 
-    /// Remove all cards and jokers from the game state.
+    /// Remove all cards from the game state.
     pub fn clear(&mut self) {
-        self.cards.clear();
+        self.board = Group::default();
+        self.hand = Group::default();
     }
 
-    /// Add a card to the game state.
-    pub fn add_card(&mut self, card: Card) {
-        self.cards.push(card);
+    /// Add a card in the player's hand.
+    pub fn add_hand_card(&mut self, card: Card) {
+        self.hand.cards.push(card);
+    }
+
+    /// Add a card to the game board.
+    pub fn add_board_card(&mut self, card: Card) {
+        self.board.cards.push(card);
     }
 
     /// Solve the current game state. If no solution exists, returns None.
     pub fn solve(&self) -> Option<Solution> {
-        solver::solve(&self.cards)
+        solver::solve(&self.board, &self.hand)
     }
 }
